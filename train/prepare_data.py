@@ -71,37 +71,115 @@ def load_and_split_data():
 
 def calculate_rewards(df):
     """
-    Calculate rewards using lambda-weighted formula:
-    reward = (1 - lambda) * ndcg + lambda * (1 - normalized_latency)
+    为每条查询计算五条检索管线的奖励。
+
+    奖励由两部分组成：
+    1. 检索质量：ndcg
+    2. 检索效率：1 - normalized_latency
+
+    LAMBDA 控制两部分的权重。
     """
 
-    # Extract values (column order follows ARM_NAMES, so arm i == column i everywhere)
+    # NDCG_COLS 是五条管线的 nDCG 列名列表。
+    # df[NDCG_COLS]：从表格中选出这五列。
+    # .values：将选出的表格转换为 NumPy 数组。
+    #
+    # 假设有 N 条查询，得到的形状是 [N, 5]。
+    # 每一行：一道查询。
+    # 每一列：一条检索管线。
     ndcg_values = df[NDCG_COLS].values
+
+    # 取出五条管线的检索耗时，同样得到 [N, 5]。
+    #
+    # 注意：耗时列与 nDCG 列必须按照同样的管线顺序排列。
+    # 这样，第 i 列的质量和耗时才属于同一条管线。
     latency_values = df[LATENCY_COLS].values
 
-    # Per-row normalize latency (This keeps latency relative to the query)
+    # 对每一行的五个耗时求和。
+    #
+    # axis=1：沿着列的方向求和，即分别处理每一道查询。
+    # keepdims=True：保留二维形状。
+    #
+    # 形状变化：
+    # [N, 5] → [N, 1]
     latency_sum = latency_values.sum(axis=1, keepdims=True)
+
+    # 每条管线的耗时，除以这道查询对应的五条管线耗时总和。
+    #
+    # NumPy 会自动把每行的总耗时应用到该行的五个元素上，
+    # 这个过程叫作“广播”。
+    #
+    # 1e-9 = 0.000000001，用于避免分母为 0。
+    #
+    # 结果形状仍为 [N, 5]。
     normalized_latency = latency_values / (latency_sum + 1e-9)
 
-    # Calculate raw rewards
-    rewards = (1 - LAMBDA) * ndcg_values + LAMBDA * (1 - normalized_latency)
+    # 逐个元素计算奖励。
+    #
+    # (1 - LAMBDA) * ndcg_values：
+    # 检索质量贡献。nDCG 越高，这部分越大。
+    #
+    # LAMBDA * (1 - normalized_latency)：
+    # 检索效率贡献。耗时越短，这部分越大。
+    #
+    # 最终得到 [N, 5] 的奖励数组。
+    rewards = (
+        (1 - LAMBDA) * ndcg_values
+        + LAMBDA * (1 - normalized_latency)
+    )
 
-    # =========================================================================
-    # FIX: REMOVED NORMALIZATION
-    # We want the absolute values (e.g., 0.8 vs 0.1) so the Trainer knows
-    # which queries are "high stakes" vs "noise".
-    # =========================================================================
-
-    # Assign RAW rewards back to DF
+    # 将五列奖励写回原始表格。
+    #
+    # enumerate(REWARD_COLS) 会依次得到：
+    # i=0，第一个奖励列名；
+    # i=1，第二个奖励列名；
+    # ...
+    #
+    # rewards[:, i]：
+    # 取出所有查询在第 i 条管线上的奖励。
     for i, col in enumerate(REWARD_COLS):
         df[col] = rewards[:, i]
 
-    # Analysis columns
-    arm_index = {col: i for i, col in enumerate(REWARD_COLS)}
-    df["optimal_reward"] = df[REWARD_COLS].max(axis=1)
-    df["optimal_arm"] = df[REWARD_COLS].idxmax(axis=1).map(arm_index)
+    # 建立“奖励列名 → 管线编号”的字典。
+    #
+    # 例如：
+    # {
+    #     "MULTIMODAL_RERANK_reward": 0,
+    #     "MULTIMODAL-SINGLE_reward": 1,
+    #     "TEXT_RERANK_reward": 2,
+    #     "TEXT-SINGLE_reward": 3,
+    #     "BM25_reward": 4,
+    # }
+    arm_index = {
+        col: i for i, col in enumerate(REWARD_COLS)
+    }
 
+    # 对每一道查询，取五个奖励中的最大值。
+    #
+    # 例如奖励为：
+    # [0.92, 0.808, 0.864, 0.736, 0.512]
+    #
+    # 这一行的 optimal_reward 就是 0.92。
+    df["optimal_reward"] = df[REWARD_COLS].max(axis=1)
+
+    # idxmax(axis=1)：
+    # 找出每行最大奖励对应的“列名”。
+    #
+    # .map(arm_index)：
+    # 将这个列名转换成管线编号。
+    #
+    # 例如：
+    # "MULTIMODAL_RERANK_reward" → 0
+    df["optimal_arm"] = (
+        df[REWARD_COLS]
+        .idxmax(axis=1)
+        .map(arm_index)
+    )
+
+    # 返回添加了奖励列、最优奖励和最优管线编号的表格。
+    # 这个函数也直接修改了传入的 df。
     return df
+
 
 def save_datasets(train_df, val_df, test_df, paths=None):
     train_path, val_path, test_path = paths or (TRAIN_DATA_PATH, VAL_DATA_PATH, TEST_DATA_PATH)
