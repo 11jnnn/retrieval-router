@@ -87,41 +87,102 @@ def create_test_dataset(test_df: pd.DataFrame, tokenizer):
     ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
     return ds
 
-
 def compute_metrics(eval_pred) -> dict:
     """
-    Compute evaluation metrics based on NDCG scores.
-    Compatible with HuggingFace Trainer's compute_metrics interface.
+    评估路由器的管线选择结果。
 
-    Args:
-        eval_pred: EvalPrediction object or tuple of (logits, true_ndcgs)
-
-    Returns:
-        Dictionary of metrics
+    返回：
+    选择最优管线的准确率、分布相似度、
+    所选管线的平均评分、理想平均评分、
+    以及距离理想结果的差距。
     """
-    logits, true_ndcgs = eval_pred
-    pred_probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
 
-    # Normalize NDCG scores for distribution comparison
+    # 拆出模型预测分数和各管线的真实评分。
+    # 两者形状均为 [N, 5]。
+    logits, true_ndcgs = eval_pred
+
+    # 将 logits 转成预测概率。
+    #
+    # dim=-1：对每条查询的五条管线进行 softmax。
+    # .numpy()：转换为 NumPy 数组，供后面计算指标。
+    pred_probs = torch.softmax(
+        torch.tensor(logits),
+        dim=-1,
+    ).numpy()
+
+    # 将每条查询的真实评分归一化，使其总和约为 1。
+    #
+    # 对于每一行 r：
+    # 如果评分总和 > 0，就让每个评分除以总和。
+    # 如果评分全为 0，就使用均匀分布。
+    #
+    # 这里的归一化只用于计算分布相似度。
+    # 它和训练时的 softmax(reward / temperature) 不同。
     label_probs = np.array([
-        r / (np.sum(r) + EPS) if np.sum(r) > 0 else np.ones(len(r)) / len(r)
+        r / (np.sum(r) + EPS)
+        if np.sum(r) > 0
+        else np.ones(len(r)) / len(r)
         for r in true_ndcgs
     ])
 
+    # 找到每条查询预测概率最大的管线编号。
+    #
+    # [N, 5] → [N]
     pred_labels = np.argmax(pred_probs, axis=1)
+
+    # 找到每条查询真实评分最高的管线编号。
+    #
+    # [N, 5] → [N]
     true_labels = np.argmax(true_ndcgs, axis=1)
+
+    # 比较预测管线和最优管线的编号是否一致。
+    # 计算选对最优管线的查询比例。
     accuracy = accuracy_score(true_labels, pred_labels)
 
+    # 逐条查询计算：
+    # 模型预测概率 p 与归一化真实评分 l 的余弦相似度。
+    #
+    # np.dot(p, l)：两个向量的点积。
+    # np.linalg.norm(...)：向量的长度，即 L2 范数。
+    #
+    # 最后对所有查询的余弦相似度求平均。
     cosine = np.mean([
-        np.dot(p, l) / (np.linalg.norm(p) * np.linalg.norm(l) + EPS)
+        np.dot(p, l)
+        / (
+            np.linalg.norm(p) * np.linalg.norm(l)
+            + EPS
+        )
         for p, l in zip(pred_probs, label_probs)
     ])
 
-    predicted_ndcg = np.mean([true_ndcgs[i, pred_labels[i]] for i in range(len(pred_labels))])
-    oracle_ndcg = np.mean(np.max(true_ndcgs, axis=1))
+    # 对每条查询，读取模型选中管线的真实评分。
+    #
+    # true_ndcgs[i, pred_labels[i]]：
+    # 第 i 条查询，模型所选管线对应的评分。
+    #
+    # 最后对所有查询求平均。
+    predicted_ndcg = np.mean([
+        true_ndcgs[i, pred_labels[i]]
+        for i in range(len(pred_labels))
+    ])
+
+    # 对每条查询，取五条管线中的最高真实评分。
+    # 再对所有查询求平均。
+    #
+    # 代表“每道查询都选中最优管线”的理想结果。
+    oracle_ndcg = np.mean(
+        np.max(true_ndcgs, axis=1)
+    )
+
+    # 理想平均评分减去模型实际选择的平均评分。
+    # 表示路由决策造成的平均评分损失。
     regret = oracle_ndcg - predicted_ndcg
+
+    # 将上述差距除以理想平均评分。
+    # 得到相对差距。
     normalized_regret = regret / (oracle_ndcg + EPS)
 
+    # 返回所有评估指标。
     return {
         "accuracy": accuracy,
         "cosine_similarity": cosine,
@@ -130,7 +191,6 @@ def compute_metrics(eval_pred) -> dict:
         "regret": regret,
         "normalized_regret": normalized_regret,
     }
-
 
 @torch.no_grad()
 def run_inference(model, tokenizer, test_df: pd.DataFrame, batch_size: int = INFERENCE_BATCH_SIZE) -> np.ndarray:
