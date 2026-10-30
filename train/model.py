@@ -104,40 +104,139 @@ def build_model(num_labels: int):
     # 返回完整模型对象，供后续训练或推理调用。
     return model
 
-
-
+# 继承 PyTorch 的 nn.Module，定义一个模型类。
 class QwenForSoftClassification(nn.Module):
-    """Qwen3 + mean pooling + a linear head over the arms.
+    """
+    使用 Qwen3 提取查询特征，再通过平均池化和线性层，
+    得到各条检索管线的分类分数。
 
-    Deliberately logits-only: the loss lives in an Objective, not in the model. That is what
-    lets RetrievalRouter and the baselines share this exact architecture while
-    differing solely in their training signal.
+    这个类负责输出 logits。
+    训练损失由外部的 Objective 计算。
     """
 
-    def __init__(self, base_model, num_labels: int, hidden_size: int = 1024, dropout: float = 0.1):
+    # 创建模型对象时执行 __init__。
+    #
+    # base_model：
+    # 上一段代码传入的、已经加入 LoRA 的 Qwen3。
+    #
+    # num_labels：
+    # 分类数量。RetrievalRouter 中为 5。
+    #
+    # hidden_size：
+    # 每个 token 的隐藏状态维度，这里为 1024。
+    #
+    # dropout：
+    # 分类前的 dropout 概率，默认 0.1。
+    def __init__(
+        self,
+        base_model,
+        num_labels: int,
+        hidden_size: int = 1024,
+        dropout: float = 0.1,
+    ):
+        # 初始化父类 nn.Module。
+        # 使 PyTorch 可以管理这个模型的子模块和参数。
         super().__init__()
+
+        # 保存 Qwen3 + LoRA，后面用它处理查询。
         self.base_model = base_model
+
+        # 创建 Dropout 层。
+        # 训练时随机将约 10% 的输入分量置零，
+        # 用于降低过拟合。
         self.dropout = nn.Dropout(dropout)
+
+        # 创建线性分类层：
+        # 输入：1024 维查询向量。
+        # 输出：5 个管线分数。
         self.classifier = nn.Linear(hidden_size, num_labels)
 
+        # 初始化分类层权重。
+        # 从均值为 0、标准差为 0.02 的正态分布中取值。
         nn.init.normal_(self.classifier.weight, std=0.02)
+
+        # 将分类层偏置初始化为 0。
         nn.init.zeros_(self.classifier.bias)
 
+    # @property 让调用者可以通过 model.device 读取设备，
+    # 而不需要写 model.device()。
     @property
     def device(self):
+        # self.parameters() 返回模型参数的迭代器。
+        # next(...) 取出第一个参数。
+        # .device 查看这个参数位于 CPU 还是 GPU。
         return next(self.parameters()).device
 
+    # 每次调用 model(...) 时，PyTorch 会执行 forward。
+    #
+    # input_ids：
+    # 查询的 token 编号，形状为 [B, L]。
+    #
+    # attention_mask：
+    # 标记真实 token 和补齐位置，形状为 [B, L]。
+    # 真实 token 为 1，补齐位置为 0。
+    #
+    # B：批次中的查询数量。
+    # L：该批次补齐后的序列长度。
     def forward(self, input_ids, attention_mask):
+
+        # 将查询交给 Qwen3 处理。
+        # attention_mask 让模型识别哪些位置是补齐位置。
+        # output_hidden_states=True 要求返回各层隐藏状态。
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
 
-        # Mean pooling over the sequence, ignoring padding.
+        # 取最后一层的隐藏状态。
+        #
+        # 形状：[B, L, 1024]
+        # 每条查询的每个 token 都对应一个 1024 维向量。
         hidden_states = outputs.last_hidden_state
-        mask = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-        pooled = torch.sum(hidden_states * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
 
+        # 将 attention_mask 扩展为与隐藏状态相同的形状。
+        #
+        # unsqueeze(-1)：
+        # [B, L] → [B, L, 1]
+        #
+        # expand(hidden_states.size())：
+        # [B, L, 1] → [B, L, 1024]
+        #
+        # float()：
+        # 将掩码转换为浮点数，方便参与乘法和除法。
+        mask = (
+            attention_mask
+            .unsqueeze(-1)
+            .expand(hidden_states.size())
+            .float()
+        )
+
+        # 进行忽略补齐位置的平均池化。
+        #
+        # hidden_states * mask：
+        # 将补齐位置的向量乘以 0。
+        #
+        # torch.sum(..., dim=1)：
+        # 沿 token 维度求和，将 [B, L, 1024]
+        # 压缩为 [B, 1024]。
+        #
+        # mask.sum(dim=1)：
+        # 得到有效 token 数量，在每个特征维度上重复。
+        #
+        # torch.clamp(..., min=1e-9)：
+        # 保证分母至少为 1e-9，避免除以 0。
+        pooled = (
+            torch.sum(hidden_states * mask, dim=1)
+            / torch.clamp(mask.sum(dim=1), min=1e-9)
+        )
+
+        # 先对查询向量执行 Dropout，
+        # 再通过线性分类层得到五个分数。
+        #
+        # [B, 1024] → [B, 5]
         logits = self.classifier(self.dropout(pooled))
+
+        # 返回字典，供外部训练或推理代码使用。
         return {"logits": logits}
+
